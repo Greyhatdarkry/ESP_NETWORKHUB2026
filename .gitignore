@@ -1,0 +1,7 @@
+/build/
+/sdkconfig
+/sdkconfig.*
+!/sdkconfig.defaults
+*.bin
+/flash_backup/
+/flash_backup_16k/

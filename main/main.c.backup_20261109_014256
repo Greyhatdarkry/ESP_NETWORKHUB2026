@@ -1,0 +1,912 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <inttypes.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "diagnostics.h"
+#include "file_sharing.h"
+#include "nvs_flash.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "esp_mac.h"
+#include "esp_log.h"
+#include "esp_http_server.h"
+#include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_chip_info.h"
+#include "esp_err.h"
+#include "cJSON.h"
+
+#define WIFI_AP_SSID       "ESP32-NETWORK-HUB"
+#define WIFI_AP_PASSWORD   "HubStart2026"
+#define WIFI_AP_CHANNEL    1
+#define WIFI_MAX_CLIENTS   4
+#define MAX_SCAN_RESULTS   30
+#define MAX_BODY_SIZE      512
+
+#define RECONNECT_INTERVAL_MS 5000
+
+static const char *TAG = "NETWORK_HUB";
+
+extern const unsigned char index_html_start[] asm("_binary_index_html_start");
+extern const unsigned char index_html_end[] asm("_binary_index_html_end");
+
+static httpd_handle_t server = NULL;
+static esp_netif_t *ap_netif = NULL;
+static esp_netif_t *sta_netif = NULL;
+
+static volatile bool sta_connected = false;
+static volatile bool sta_connecting = false;
+static volatile bool sta_configured = false;
+static volatile bool manual_disconnect = false;
+static volatile bool reconnect_task_active = false;
+
+static volatile int reconnect_attempts = 0;
+static volatile int last_disconnect_reason = 0;
+
+static char connected_ssid[33] = {0};
+static char sta_ip_address[16] = "Not connected";
+
+static int64_t connection_start_time = 0;
+
+/* ---------------------------------------------------------
+   JSON RESPONSE
+--------------------------------------------------------- */
+
+static esp_err_t send_json(httpd_req_t *req, cJSON *root)
+{
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "JSON creation failed");
+        return ESP_FAIL;
+    }
+
+    char *json = cJSON_PrintUnformatted(root);
+
+    if (!json) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "JSON encoding failed");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    esp_err_t result = httpd_resp_sendstr(req, json);
+
+    free(json);
+    cJSON_Delete(root);
+
+    return result;
+}
+
+/* ---------------------------------------------------------
+   WIFI SECURITY
+--------------------------------------------------------- */
+
+static const char *get_security_name(wifi_auth_mode_t auth)
+{
+    switch (auth) {
+        case WIFI_AUTH_OPEN: return "Open";
+        case WIFI_AUTH_WEP: return "WEP";
+        case WIFI_AUTH_WPA_PSK: return "WPA";
+        case WIFI_AUTH_WPA2_PSK: return "WPA2";
+        case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
+        case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2 Enterprise";
+        case WIFI_AUTH_WPA3_PSK: return "WPA3";
+        case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
+        default: return "Unknown";
+    }
+}
+
+/* ---------------------------------------------------------
+   AUTOMATIC RECONNECTION TASK
+--------------------------------------------------------- */
+
+static void reconnect_task(void *parameter)
+{
+    ESP_LOGW(TAG, "Automatic reconnection started");
+
+    while (sta_configured && !manual_disconnect && !sta_connected) {
+
+        vTaskDelay(pdMS_TO_TICKS(RECONNECT_INTERVAL_MS));
+
+        if (!sta_configured || manual_disconnect || sta_connected) {
+            break;
+        }
+
+        reconnect_attempts++;
+
+        ESP_LOGW(
+            TAG,
+            "Reconnection attempt #%d",
+            reconnect_attempts
+        );
+
+        esp_err_t result = esp_wifi_connect();
+
+        if (result != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "Reconnect request failed: %s",
+                esp_err_to_name(result)
+            );
+        }
+    }
+
+    reconnect_task_active = false;
+
+    ESP_LOGI(TAG, "Reconnection task stopped");
+
+    vTaskDelete(NULL);
+}
+
+static void start_reconnect_task(void)
+{
+    if (reconnect_task_active || !sta_configured ||
+        manual_disconnect || sta_connected) {
+        return;
+    }
+
+    reconnect_task_active = true;
+
+    BaseType_t result = xTaskCreate(
+        reconnect_task,
+        "wifi_reconnect",
+        3072,
+        NULL,
+        5,
+        NULL
+    );
+
+    if (result != pdPASS) {
+        reconnect_task_active = false;
+        ESP_LOGE(TAG, "Failed to create reconnection task");
+    }
+}
+
+/* ---------------------------------------------------------
+   WIFI EVENT HANDLER
+--------------------------------------------------------- */
+
+static void wifi_event_handler(
+    void *arg,
+    esp_event_base_t event_base,
+    int32_t event_id,
+    void *event_data)
+{
+    if (event_base == WIFI_EVENT) {
+
+        switch (event_id) {
+
+            case WIFI_EVENT_AP_STACONNECTED: {
+                wifi_event_ap_staconnected_t *event =
+                    (wifi_event_ap_staconnected_t *)event_data;
+
+                ESP_LOGI(TAG, "AP client connected: " MACSTR,
+                         MAC2STR(event->mac));
+                break;
+            }
+
+            case WIFI_EVENT_AP_STADISCONNECTED: {
+                wifi_event_ap_stadisconnected_t *event =
+                    (wifi_event_ap_stadisconnected_t *)event_data;
+
+                ESP_LOGI(TAG, "AP client disconnected: " MACSTR,
+                         MAC2STR(event->mac));
+                break;
+            }
+
+            case WIFI_EVENT_STA_START:
+                ESP_LOGI(TAG, "Station interface started");
+                break;
+
+            case WIFI_EVENT_STA_CONNECTED:
+                ESP_LOGI(TAG, "Connected to router; waiting for IP");
+                sta_connecting = true;
+                break;
+
+            case WIFI_EVENT_STA_DISCONNECTED: {
+                wifi_event_sta_disconnected_t *event =
+                    (wifi_event_sta_disconnected_t *)event_data;
+
+                sta_connected = false;
+                connection_start_time = 0;
+
+                last_disconnect_reason = event->reason;
+
+                strcpy(sta_ip_address, "Not connected");
+
+                ESP_LOGW(
+                    TAG,
+                    "Router disconnected. Reason: %d",
+                    last_disconnect_reason
+                );
+
+                if (sta_configured && !manual_disconnect) {
+                    sta_connecting = true;
+                    start_reconnect_task();
+                } else {
+                    sta_connecting = false;
+                }
+
+                break;
+            }
+
+            default:
+                break;
+        }
+    }
+
+    if (event_base == IP_EVENT &&
+        event_id == IP_EVENT_STA_GOT_IP) {
+
+        ip_event_got_ip_t *event =
+            (ip_event_got_ip_t *)event_data;
+
+        snprintf(
+            sta_ip_address,
+            sizeof(sta_ip_address),
+            IPSTR,
+            IP2STR(&event->ip_info.ip)
+        );
+
+        sta_connected = true;
+        sta_connecting = false;
+
+        reconnect_attempts = 0;
+        last_disconnect_reason = 0;
+
+        connection_start_time = esp_timer_get_time();
+
+        ESP_LOGI(TAG, "Router connection successful");
+        ESP_LOGI(TAG, "Assigned IP: %s", sta_ip_address);
+    }
+}
+
+/* ---------------------------------------------------------
+   ROOT DASHBOARD
+--------------------------------------------------------- */
+
+static esp_err_t root_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    return httpd_resp_send(
+        req,
+        (const char *)index_html_start,
+        index_html_end - index_html_start
+    );
+}
+
+/* ---------------------------------------------------------
+   DEVICE STATUS API
+--------------------------------------------------------- */
+
+static esp_err_t status_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+
+    if (!root) {
+        return ESP_FAIL;
+    }
+
+    wifi_sta_list_t clients = {0};
+    esp_wifi_ap_get_sta_list(&clients);
+
+    wifi_ap_record_t router_info = {0};
+    int router_rssi = 0;
+
+    if (sta_connected &&
+        esp_wifi_sta_get_ap_info(&router_info) == ESP_OK) {
+        router_rssi = router_info.rssi;
+    }
+
+    esp_netif_ip_info_t ap_ip_info = {0};
+
+    if (ap_netif) {
+        esp_netif_get_ip_info(ap_netif, &ap_ip_info);
+    }
+
+    char ap_ip[16];
+
+    snprintf(
+        ap_ip,
+        sizeof(ap_ip),
+        IPSTR,
+        IP2STR(&ap_ip_info.ip)
+    );
+
+    int64_t connection_duration = 0;
+
+    if (sta_connected && connection_start_time > 0) {
+        connection_duration =
+            (esp_timer_get_time() - connection_start_time) / 1000000;
+    }
+
+    cJSON_AddStringToObject(root, "device", "ESP32 Network Hub");
+    cJSON_AddStringToObject(root, "ap_ssid", WIFI_AP_SSID);
+    cJSON_AddStringToObject(root, "ap_ip", ap_ip);
+
+    cJSON_AddNumberToObject(root, "clients", clients.num);
+
+    cJSON_AddNumberToObject(
+        root,
+        "free_heap",
+        esp_get_free_heap_size()
+    );
+
+    cJSON_AddNumberToObject(
+        root,
+        "minimum_heap",
+        esp_get_minimum_free_heap_size()
+    );
+
+    cJSON_AddNumberToObject(
+        root,
+        "uptime",
+        esp_timer_get_time() / 1000000
+    );
+
+    cJSON_AddBoolToObject(root, "router_connected", sta_connected);
+    cJSON_AddBoolToObject(root, "router_connecting", sta_connecting);
+
+    cJSON_AddStringToObject(
+        root,
+        "router_ssid",
+        sta_connected ? connected_ssid : ""
+    );
+
+    cJSON_AddStringToObject(root, "router_ip", sta_ip_address);
+
+    cJSON_AddNumberToObject(root, "router_rssi", router_rssi);
+
+    cJSON_AddNumberToObject(
+        root,
+        "connection_duration",
+        connection_duration
+    );
+
+    cJSON_AddNumberToObject(
+        root,
+        "reconnect_attempts",
+        reconnect_attempts
+    );
+
+    cJSON_AddNumberToObject(
+        root,
+        "last_disconnect_reason",
+        last_disconnect_reason
+    );
+
+    return send_json(req, root);
+}
+
+/* ---------------------------------------------------------
+   CONNECTED CLIENTS API
+--------------------------------------------------------- */
+
+static esp_err_t clients_handler(httpd_req_t *req)
+{
+    wifi_sta_list_t clients = {0};
+
+    if (esp_wifi_ap_get_sta_list(&clients) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Unable to retrieve clients");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *array = cJSON_CreateArray();
+
+    if (!root || !array) {
+        cJSON_Delete(root);
+        cJSON_Delete(array);
+        return ESP_FAIL;
+    }
+
+    cJSON_AddNumberToObject(root, "count", clients.num);
+
+    for (int i = 0; i < clients.num; i++) {
+
+        cJSON *client = cJSON_CreateObject();
+        char mac[18];
+
+        snprintf(
+            mac,
+            sizeof(mac),
+            MACSTR,
+            MAC2STR(clients.sta[i].mac)
+        );
+
+        cJSON_AddStringToObject(client, "mac", mac);
+        cJSON_AddNumberToObject(client, "rssi", clients.sta[i].rssi);
+
+        cJSON_AddItemToArray(array, client);
+    }
+
+    cJSON_AddItemToObject(root, "clients", array);
+
+    return send_json(req, root);
+}
+
+/* ---------------------------------------------------------
+   WIFI SCANNER API
+--------------------------------------------------------- */
+
+static esp_err_t scan_handler(httpd_req_t *req)
+{
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE
+    };
+
+    esp_err_t result = esp_wifi_scan_start(&scan_config, true);
+
+    if (result != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Wi-Fi scan failed");
+        return ESP_FAIL;
+    }
+
+    uint16_t ap_count = 0;
+
+    esp_wifi_scan_get_ap_num(&ap_count);
+
+    if (ap_count > MAX_SCAN_RESULTS) {
+        ap_count = MAX_SCAN_RESULTS;
+    }
+
+    wifi_ap_record_t *records =
+        calloc(ap_count > 0 ? ap_count : 1, sizeof(wifi_ap_record_t));
+
+    if (!records) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Memory allocation failed");
+        return ESP_FAIL;
+    }
+
+    result = esp_wifi_scan_get_ap_records(&ap_count, records);
+
+    if (result != ESP_OK) {
+        free(records);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Unable to retrieve scan results");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *networks = cJSON_CreateArray();
+
+    if (!root || !networks) {
+        free(records);
+        cJSON_Delete(root);
+        cJSON_Delete(networks);
+        return ESP_FAIL;
+    }
+
+    cJSON_AddNumberToObject(root, "count", ap_count);
+
+    for (int i = 0; i < ap_count; i++) {
+
+        cJSON *network = cJSON_CreateObject();
+
+        cJSON_AddStringToObject(
+            network,
+            "ssid",
+            (const char *)records[i].ssid
+        );
+
+        cJSON_AddNumberToObject(network, "rssi", records[i].rssi);
+        cJSON_AddNumberToObject(network, "channel", records[i].primary);
+
+        cJSON_AddStringToObject(
+            network,
+            "security",
+            get_security_name(records[i].authmode)
+        );
+
+        cJSON_AddItemToArray(networks, network);
+    }
+
+    cJSON_AddItemToObject(root, "networks", networks);
+
+    free(records);
+
+    return send_json(req, root);
+}
+
+/* ---------------------------------------------------------
+   READ HTTP BODY
+--------------------------------------------------------- */
+
+static char *read_request_body(httpd_req_t *req)
+{
+    if (req->content_len <= 0 ||
+        req->content_len > MAX_BODY_SIZE) {
+        return NULL;
+    }
+
+    char *buffer = calloc(1, req->content_len + 1);
+
+    if (!buffer) {
+        return NULL;
+    }
+
+    int received = 0;
+
+    while (received < req->content_len) {
+
+        int ret = httpd_req_recv(
+            req,
+            buffer + received,
+            req->content_len - received
+        );
+
+        if (ret <= 0) {
+            free(buffer);
+            return NULL;
+        }
+
+        received += ret;
+    }
+
+    return buffer;
+}
+
+/* ---------------------------------------------------------
+   ROUTER CONNECT API
+--------------------------------------------------------- */
+
+static esp_err_t connect_handler(httpd_req_t *req)
+{
+    char *body = read_request_body(req);
+
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Invalid request body");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *ssid_item =
+        cJSON_GetObjectItemCaseSensitive(root, "ssid");
+
+    cJSON *password_item =
+        cJSON_GetObjectItemCaseSensitive(root, "password");
+
+    if (!cJSON_IsString(ssid_item) ||
+        !cJSON_IsString(password_item)) {
+
+        cJSON_Delete(root);
+
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "SSID and password are required");
+        return ESP_FAIL;
+    }
+
+    const char *ssid = ssid_item->valuestring;
+    const char *password = password_item->valuestring;
+
+    size_t ssid_length = strlen(ssid);
+    size_t password_length = strlen(password);
+
+    if (ssid_length == 0 || ssid_length > 32 ||
+        password_length > 64) {
+
+        cJSON_Delete(root);
+
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Invalid SSID or password length");
+        return ESP_FAIL;
+    }
+
+    wifi_config_t config = {0};
+
+    memcpy(config.sta.ssid, ssid, ssid_length);
+    memcpy(config.sta.password, password, password_length);
+
+    config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    config.sta.pmf_cfg.capable = true;
+    config.sta.pmf_cfg.required = false;
+
+    cJSON_Delete(root);
+
+    manual_disconnect = true;
+    sta_connected = false;
+    sta_connecting = true;
+    sta_configured = false;
+
+    esp_wifi_disconnect();
+
+    esp_err_t result = esp_wifi_set_config(WIFI_IF_STA, &config);
+
+    if (result != ESP_OK) {
+        sta_connecting = false;
+        manual_disconnect = false;
+
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Unable to configure Wi-Fi");
+        return ESP_FAIL;
+    }
+
+    strlcpy(connected_ssid, ssid, sizeof(connected_ssid));
+
+    strcpy(sta_ip_address, "Connecting...");
+
+    reconnect_attempts = 0;
+    last_disconnect_reason = 0;
+
+    sta_configured = true;
+    manual_disconnect = false;
+
+    result = esp_wifi_connect();
+
+    if (result != ESP_OK) {
+        sta_connecting = false;
+
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Unable to start connection");
+        return ESP_FAIL;
+    }
+
+    cJSON *response = cJSON_CreateObject();
+
+    cJSON_AddBoolToObject(response, "success", true);
+    cJSON_AddStringToObject(
+        response,
+        "message",
+        "Connection attempt started"
+    );
+
+    return send_json(req, response);
+}
+
+/* ---------------------------------------------------------
+   ROUTER DISCONNECT API
+--------------------------------------------------------- */
+
+static esp_err_t disconnect_handler(httpd_req_t *req)
+{
+    manual_disconnect = true;
+    sta_configured = false;
+    sta_connected = false;
+    sta_connecting = false;
+
+    connection_start_time = 0;
+    reconnect_attempts = 0;
+
+    connected_ssid[0] = '\0';
+
+    strcpy(sta_ip_address, "Not connected");
+
+    esp_err_t result = esp_wifi_disconnect();
+
+    if (result != ESP_OK &&
+        result != ESP_ERR_WIFI_NOT_CONNECT) {
+
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Unable to disconnect");
+        return ESP_FAIL;
+    }
+
+    cJSON *response = cJSON_CreateObject();
+
+    cJSON_AddBoolToObject(response, "success", true);
+    cJSON_AddStringToObject(
+        response,
+        "message",
+        "Disconnected from router"
+    );
+
+    return send_json(req, response);
+}
+
+/* ---------------------------------------------------------
+   RESTART API
+--------------------------------------------------------- */
+
+static esp_err_t restart_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+
+    httpd_resp_sendstr(
+        req,
+        "{\"success\":true,\"message\":\"Restarting\"}"
+    );
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    esp_restart();
+
+    return ESP_OK;
+}
+
+/* ---------------------------------------------------------
+   WEB SERVER
+--------------------------------------------------------- */
+
+static httpd_handle_t start_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+
+    config.server_port = 80;
+    config.max_uri_handlers = 20;
+    config.lru_purge_enable = true;
+    config.stack_size = 8192;
+
+    esp_err_t result = httpd_start(&server, &config);
+
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to start HTTP server: %s",
+                 esp_err_to_name(result));
+        server = NULL;
+        return NULL;
+    }
+
+    httpd_uri_t routes[] = {
+        { .uri = "/", .method = HTTP_GET, .handler = root_handler },
+        { .uri = "/api/status", .method = HTTP_GET, .handler = status_handler },
+        { .uri = "/api/clients", .method = HTTP_GET, .handler = clients_handler },
+        { .uri = "/api/scan", .method = HTTP_GET, .handler = scan_handler },
+        { .uri = "/api/connect", .method = HTTP_POST, .handler = connect_handler },
+        { .uri = "/api/disconnect", .method = HTTP_POST, .handler = disconnect_handler },
+        { .uri = "/api/restart", .method = HTTP_POST, .handler = restart_handler }
+    };
+
+    const size_t route_count = sizeof(routes) / sizeof(routes[0]);
+
+    /* Register dashboard routes exactly once. */
+    for (size_t i = 0; i < route_count; i++) {
+        result = httpd_register_uri_handler(server, &routes[i]);
+
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "Dashboard route registration failed: %s (%s)",
+                     routes[i].uri, esp_err_to_name(result));
+            goto registration_failed;
+        }
+    }
+
+    /* Register file-sharing routes exactly once, outside the loop. */
+    result = register_file_sharing_routes(server);
+
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "File-sharing route registration failed: %s",
+                 esp_err_to_name(result));
+        goto registration_failed;
+    }
+
+    /* Register diagnostics exactly once. */
+    result = register_diagnostics_routes(server, sta_netif);
+
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Diagnostics route registration failed: %s",
+                 esp_err_to_name(result));
+        goto registration_failed;
+    }
+
+    ESP_LOGI(TAG, "All HTTP routes registered successfully");
+    ESP_LOGI(TAG, "Web server started");
+
+    return server;
+
+registration_failed:
+    httpd_stop(server);
+    server = NULL;
+    return NULL;
+}
+
+/* ---------------------------------------------------------
+   WIFI INITIALIZATION
+--------------------------------------------------------- */
+
+static void initialize_wifi(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    ap_netif = esp_netif_create_default_wifi_ap();
+    sta_netif = esp_netif_create_default_wifi_sta();
+
+    if (!ap_netif || !sta_netif) {
+        ESP_LOGE(TAG, "Unable to create Wi-Fi interfaces");
+        abort();
+    }
+
+    wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
+
+    ESP_ERROR_CHECK(esp_wifi_init(&init_config));
+
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(
+            WIFI_EVENT,
+            ESP_EVENT_ANY_ID,
+            &wifi_event_handler,
+            NULL
+        )
+    );
+
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(
+            IP_EVENT,
+            IP_EVENT_STA_GOT_IP,
+            &wifi_event_handler,
+            NULL
+        )
+    );
+
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = WIFI_AP_SSID,
+            .ssid_len = strlen(WIFI_AP_SSID),
+            .password = WIFI_AP_PASSWORD,
+            .channel = WIFI_AP_CHANNEL,
+            .max_connection = WIFI_MAX_CLIENTS,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .beacon_interval = 100
+        }
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+    ESP_ERROR_CHECK(
+        esp_wifi_set_config(WIFI_IF_AP, &ap_config)
+    );
+
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "ESP32 Network Hub started");
+    ESP_LOGI(TAG, "AP SSID: %s", WIFI_AP_SSID);
+    ESP_LOGI(TAG, "Dashboard: http://192.168.4.1");
+}
+
+/* ---------------------------------------------------------
+   MAIN APPLICATION
+--------------------------------------------------------- */
+
+void app_main(void)
+{
+    esp_err_t ret = nvs_flash_init();
+
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+
+    ESP_ERROR_CHECK(ret);
+
+    /* Initialize file storage */
+   esp_err_t storage_result = file_sharing_init();
+
+   if (storage_result != ESP_OK) {
+      ESP_LOGE(TAG, "File storage unavailable");
+   }
+
+    /* Initialize Wi-Fi */
+    initialize_wifi();
+
+    /* Start HTTP server */
+    start_webserver();
+}

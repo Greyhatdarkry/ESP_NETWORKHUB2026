@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0b1120">
+<title>ESP32 Network Hub</title>
+<style>
+:root{--bg:#0b1120;--panel:#151f32;--panel2:#1c2940;--text:#edf2ff;--muted:#93a4bd;--accent:#38bdf8;--green:#34d399;--red:#fb7185;--yellow:#fbbf24;--border:#293951}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:Arial,sans-serif;line-height:1.45}
+header{padding:20px;background:#111b2d;border-bottom:1px solid var(--border)}
+header h1{margin:0;font-size:22px}header p{color:var(--muted);margin:7px 0 0;font-size:13px}
+.container{width:min(1100px,100%);margin:auto;padding:clamp(12px,3vw,20px)}
+.section-title{margin:26px 0 12px;font-size:18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,180px),1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--border);padding:clamp(13px,2.5vw,18px);border-radius:13px;margin-bottom:12px;min-width:0}
+.card h3{margin:0 0 12px;font-size:14px;color:var(--muted)}
+.value{font-size:23px;font-weight:bold;overflow-wrap:anywhere}
+.small{font-size:12px;color:var(--muted);margin-top:7px}
+.status{display:inline-block;padding:6px 10px;border-radius:20px;font-size:12px;background:#334155}
+.connected{color:var(--green);background:#064e3b}.disconnected{color:var(--red);background:#4c1726}.connecting{color:var(--yellow);background:#493512}
+button{border:0;border-radius:8px;padding:11px 15px;color:#07111e;background:var(--accent);font-weight:bold;cursor:pointer;margin:4px 4px 4px 0;min-height:40px}
+button.secondary{background:#334155;color:white}button.danger{background:#be123c;color:white}button:disabled{opacity:.5;cursor:not-allowed}
+input{width:100%;min-width:0;padding:12px;border:1px solid var(--border);background:#0b1527;color:white;border-radius:8px;margin:7px 0 12px;outline:none;font:inherit}
+input:focus{border-color:var(--accent);outline:2px solid #38bdf833}
+input[type=file]{cursor:pointer}
+label{font-size:13px;color:var(--muted);display:block}
+.network{padding:13px;background:var(--panel2);border:1px solid var(--border);border-radius:9px;margin:8px 0;cursor:pointer;overflow-wrap:anywhere}
+.network:hover,.network.selected{border-color:var(--accent)}
+.network strong{display:block;margin-bottom:6px}.network small{color:var(--muted)}
+.progress{height:7px;background:#334155;border-radius:10px;margin-top:9px;overflow:hidden}.progress div{height:100%;background:var(--green)}
+.notice{padding:12px;border-radius:8px;background:#172c43;color:#bae6fd;font-size:13px;margin:10px 0;overflow-wrap:anywhere}
+.metric{background:var(--panel2);border-radius:9px;padding:12px;min-width:0}
+.metric-label{font-size:12px;color:var(--muted)}.metric-value{font-size:19px;font-weight:bold;margin-top:7px;overflow-wrap:anywhere}
+.client{padding:12px;border-bottom:1px solid var(--border);font-size:13px;overflow-wrap:anywhere}
+.diag-row{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:12px 0;border-bottom:1px solid var(--border);font-size:13px}
+.diag-row:last-child{border-bottom:0}.diag-label{color:var(--muted)}.diag-value{font-weight:bold;text-align:right;overflow-wrap:anywhere;max-width:60%}
+.good{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--yellow)}
+.file-upload-area{background:var(--panel2);border:1px dashed var(--border);border-radius:10px;padding:15px;margin-top:12px}
+.file-toolbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;margin-top:15px}
+.file-item{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 0;border-bottom:1px solid var(--border)}
+.file-item:last-child{border-bottom:0}.file-info{min-width:0;overflow-wrap:anywhere}
+.file-name{font-weight:bold;font-size:13px;overflow-wrap:anywhere}.file-size{color:var(--muted);font-size:12px;margin-top:5px}
+.file-actions{display:flex;flex-wrap:wrap;flex-shrink:0}.file-actions button{padding:8px 11px;font-size:12px}
+.storage-progress{height:10px;background:#334155;border-radius:10px;overflow:hidden;margin-top:12px}
+.storage-progress div{height:100%;width:0%;background:var(--green);transition:width .3s}
+.upload-progress{height:8px;background:#334155;border-radius:10px;overflow:hidden;margin-top:10px;display:none}
+.upload-progress div{height:100%;width:0%;background:var(--accent)}
+footer{text-align:center;color:var(--muted);padding:25px;font-size:12px}
+@media(max-width:600px){
+ header{padding:16px}.container{padding:12px}.section-title{margin-top:22px}
+ .grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+ .card{padding:13px}.value{font-size:20px}.metric-value{font-size:16px}
+ .file-item{align-items:stretch;flex-direction:column}
+ .file-actions{width:100%;display:grid;grid-template-columns:1fr 1fr}
+ .file-actions button{width:100%;margin:0}
+ .file-toolbar{align-items:stretch}.file-toolbar button{width:100%;margin:0}
+ button{min-height:44px}
+}
+@media(max-width:360px){.grid{grid-template-columns:1fr}.diag-row{flex-direction:column;gap:4px}.diag-value{text-align:left;max-width:100%}}
+</style>
+</head>
+<body>
+<header><h1>ESP32 Network Hub</h1><p>Network management, monitoring and diagnostics</p></header>
+<main class="container">
+<h2 class="section-title">Device Overview</h2>
+<div class="grid">
+ <div class="card"><h3>Access Point</h3><div class="value">Online</div><div class="small" id="apAddress">192.168.4.1</div></div>
+ <div class="card"><h3>Connected Clients</h3><div class="value" id="clientCount">0</div><div class="small">Devices connected to ESP32</div></div>
+ <div class="card"><h3>Free Heap</h3><div class="value" id="freeHeap">--</div><div class="small">Available memory</div></div>
+ <div class="card"><h3>Device Uptime</h3><div class="value" id="uptime">--</div><div class="small">Time since startup</div></div>
+</div>
+
+<h2 class="section-title">Router Connection</h2>
+<div class="card">
+ <h3>Connection Status</h3><span id="routerBadge" class="status disconnected">Disconnected</span>
+ <div class="grid" style="margin-top:15px">
+  <div class="metric"><div class="metric-label">Router SSID</div><div class="metric-value" id="routerSSID">--</div></div>
+  <div class="metric"><div class="metric-label">Router IP</div><div class="metric-value" id="routerIP">--</div></div>
+  <div class="metric"><div class="metric-label">Signal Strength</div><div class="metric-value" id="routerRSSI">--</div></div>
+  <div class="metric"><div class="metric-label">Connection Duration</div><div class="metric-value" id="connectionDuration">--</div></div>
+  <div class="metric"><div class="metric-label">Reconnect Attempts</div><div class="metric-value" id="reconnectAttempts">0</div></div>
+  <div class="metric"><div class="metric-label">Last Disconnect Reason</div><div class="metric-value" id="disconnectReason">None</div></div>
+ </div>
+ <div class="notice" id="connectionMessage">Waiting for router connection.</div>
+ <button class="danger" id="disconnectButton" onclick="disconnectRouter()" disabled>Disconnect Router</button>
+</div>
+
+<h2 class="section-title">Network Diagnostics</h2>
+<div class="card">
+ <h3>Connectivity Tests</h3><p class="small">Check router gateway, DNS resolution and external network reachability.</p>
+ <button id="diagnosticsButton" onclick="runDiagnostics()">Run Diagnostics</button>
+ <span id="diagnosticsStatus" class="status">Not tested</span>
+ <div class="notice" id="diagnosticsMessage">Connect to a router before running diagnostics.</div>
+ <div style="margin-top:15px">
+  <div class="diag-row"><span class="diag-label">Router Gateway</span><span class="diag-value" id="gateway">--</span></div>
+  <div class="diag-row"><span class="diag-label">Gateway Ping</span><span class="diag-value" id="gatewayPing">--</span></div>
+  <div class="diag-row"><span class="diag-label">DNS Server</span><span class="diag-value" id="dnsServer">--</span></div>
+  <div class="diag-row"><span class="diag-label">DNS Resolution</span><span class="diag-value" id="dnsStatus">--</span></div>
+  <div class="diag-row"><span class="diag-label">Resolved Address</span><span class="diag-value" id="resolvedIP">--</span></div>
+  <div class="diag-row"><span class="diag-label">External Ping (1.1.1.1)</span><span class="diag-value" id="internetPing">--</span></div>
+ </div>
+</div>
+
+<h2 class="section-title">Router Connection Manager</h2>
+<div class="card">
+ <h3>Available Wi-Fi Networks</h3><button id="scanButton" onclick="scanNetworks()">Scan Networks</button>
+ <div id="networkList" class="small">Press Scan Networks to search for available networks.</div>
+</div>
+<div class="card">
+ <h3>Connect to Selected Network</h3>
+ <label for="selectedSSID">Selected Network</label><input id="selectedSSID" placeholder="Select a network above" readonly>
+ <label for="wifiPassword">Wi-Fi Password</label><input id="wifiPassword" type="password" placeholder="Enter router password" autocomplete="off">
+ <button id="connectButton" onclick="connectRouter()">Connect to Router</button>
+</div>
+
+<h2 class="section-title">Connected Devices</h2>
+<div class="card"><h3>ESP32 Access Point Clients</h3><div id="clientsList" class="small">Loading clients...</div></div>
+
+<h2 class="section-title">File Sharing</h2>
+<div class="card">
+ <h3>Storage Overview</h3>
+ <div class="grid">
+  <div class="metric"><div class="metric-label">Total Storage</div><div class="metric-value" id="storageTotal">--</div></div>
+  <div class="metric"><div class="metric-label">Used Storage</div><div class="metric-value" id="storageUsed">--</div></div>
+  <div class="metric"><div class="metric-label">Free Storage</div><div class="metric-value" id="storageFree">--</div></div>
+ </div>
+ <div class="storage-progress"><div id="storageBar"></div></div>
+ <div class="small" id="storageMessage">Loading storage information...</div>
+</div>
+<div class="card">
+ <h3>Upload a Password-Protected File</h3>
+ <p class="small">Each file has its own password. Anyone may see its name and size, but downloading or deleting it requires the password. Maximum file size: 32 KB.</p>
+ <div class="file-upload-area">
+  <label for="fileInput">Choose a file</label><input type="file" id="fileInput">
+  <label for="uploadPassword">Create a password for this file (8–128 characters)</label>
+  <input type="password" id="uploadPassword" minlength="8" maxlength="128" placeholder="Enter a unique file password" autocomplete="new-password">
+  <button id="uploadButton" onclick="uploadFile()">Upload Protected File</button>
+  <div class="upload-progress" id="uploadProgress"><div id="uploadProgressBar"></div></div>
+  <div class="notice" id="uploadMessage">Choose a file and create its password.</div>
+ </div>
+</div>
+<div class="card">
+ <h3>Stored Files</h3>
+ <div class="file-toolbar"><span class="small" id="fileCount">Loading files...</span><button class="secondary" id="refreshFilesButton" onclick="loadFiles()">Refresh Files</button></div>
+ <div id="filesList" style="margin-top:12px"><div class="small">Loading stored files...</div></div>
+</div>
+
+<h2 class="section-title">System Controls</h2>
+<div class="card"><h3>Restart Device</h3><button class="danger" onclick="restartDevice()">Restart ESP32</button></div>
+</main>
+<footer>ESP32 Network Hub · Password-Protected File Sharing</footer>
+
+<script>
+let selectedNetwork = "";
+const MAX_FILE_SIZE = 32 * 1024;
+
+function formatDuration(seconds) {
+ seconds=Math.max(0,Math.floor(Number(seconds)||0));
+ const d=Math.floor(seconds/86400),h=Math.floor((seconds%86400)/3600);
+ const m=Math.floor((seconds%3600)/60),s=seconds%60;
+ return `${d}d ${h}h ${m}m ${s}s`;
+}
+function formatBytes(bytes) {
+ bytes=Number(bytes)||0;
+ if(bytes<1024)return bytes+" B";
+ if(bytes<1048576)return (bytes/1024).toFixed(2)+" KB";
+ return (bytes/1048576).toFixed(2)+" MB";
+}
+function signalQuality(rssi) {
+ if(rssi>=-55)return 100;if(rssi>=-65)return 75;
+ if(rssi>=-75)return 50;if(rssi>=-85)return 25;return 10;
+}
+
+async function loadStatus() {
+ try {
+  const r=await fetch("/api/status",{cache:"no-store"});
+  if(!r.ok)throw Error("Status request failed");
+  const d=await r.json();
+  document.getElementById("apAddress").textContent=d.ap_ip??"--";
+  document.getElementById("clientCount").textContent=d.clients??0;
+  document.getElementById("freeHeap").textContent=((Number(d.free_heap)||0)/1024).toFixed(1)+" KB";
+  document.getElementById("uptime").textContent=formatDuration(d.uptime);
+  document.getElementById("routerSSID").textContent=d.router_connected?d.router_ssid:"--";
+  document.getElementById("routerIP").textContent=d.router_connected?d.router_ip:"--";
+  document.getElementById("routerRSSI").textContent=d.router_connected?d.router_rssi+" dBm":"--";
+  document.getElementById("connectionDuration").textContent=d.router_connected?formatDuration(d.connection_duration):"--";
+  document.getElementById("reconnectAttempts").textContent=d.reconnect_attempts??0;
+  document.getElementById("disconnectReason").textContent=d.last_disconnect_reason===0?"None":(d.last_disconnect_reason??"None");
+  const badge=document.getElementById("routerBadge"),msg=document.getElementById("connectionMessage"),btn=document.getElementById("disconnectButton");
+  if(d.router_connected){badge.textContent="Connected";badge.className="status connected";msg.textContent="Router connection is active.";btn.disabled=false;}
+  else if(d.router_connecting){badge.textContent="Connecting / Reconnecting";badge.className="status connecting";msg.textContent="Attempting to connect to the router.";btn.disabled=false;}
+  else{badge.textContent="Disconnected";badge.className="status disconnected";msg.textContent="Not connected to a router.";btn.disabled=true;}
+ } catch(e){console.error("Status error:",e);}
+}
+
+async function runDiagnostics() {
+ const b=document.getElementById("diagnosticsButton"),s=document.getElementById("diagnosticsStatus"),m=document.getElementById("diagnosticsMessage");
+ b.disabled=true;b.textContent="Testing...";s.textContent="Running";s.className="status connecting";m.textContent="Running connectivity checks...";
+ try {
+  const r=await fetch("/api/diagnostics",{cache:"no-store"});if(!r.ok)throw Error("Diagnostics request failed");
+  const d=await r.json();
+  document.getElementById("gateway").textContent=d.gateway||"--";
+  document.getElementById("dnsServer").textContent=d.dns_server||"--";
+  document.getElementById("resolvedIP").textContent=d.resolved_ip||"--";
+  const gp=document.getElementById("gatewayPing"),ds=document.getElementById("dnsStatus"),ip=document.getElementById("internetPing");
+  gp.textContent=d.gateway_ping_ok?`Reachable · ${d.gateway_ping_average_ms} ms`:"No ICMP reply";gp.className="diag-value "+(d.gateway_ping_ok?"good":"warn");
+  ds.textContent=d.dns_ok?"Resolution successful":"Resolution failed";ds.className="diag-value "+(d.dns_ok?"good":"bad");
+  ip.textContent=d.internet_ping_ok?`Reachable · ${d.internet_ping_average_ms} ms`:"No ICMP reply";ip.className="diag-value "+(d.internet_ping_ok?"good":"warn");
+  m.textContent=d.message||"Diagnostics completed.";
+  if(d.connected&&d.gateway_ping_ok&&d.dns_ok&&d.internet_ping_ok){s.textContent="Healthy";s.className="status connected";}
+  else if(d.connected&&d.dns_ok){s.textContent="Partial";s.className="status connecting";}
+  else{s.textContent="Check Network";s.className="status disconnected";}
+ } catch(e){s.textContent="Error";s.className="status disconnected";m.textContent="Unable to complete diagnostics.";console.error(e);}
+ finally{b.disabled=false;b.textContent="Run Diagnostics";}
+}
+
+async function scanNetworks() {
+ const b=document.getElementById("scanButton"),list=document.getElementById("networkList");
+ b.disabled=true;b.textContent="Scanning...";list.textContent="Searching for networks...";
+ try {
+  const r=await fetch("/api/scan",{cache:"no-store"});if(!r.ok)throw Error("Scan failed");
+  const d=await r.json();list.innerHTML="";
+  if(!d.networks||!d.networks.length){list.textContent="No networks found.";return;}
+  d.networks.sort((a,b)=>b.rssi-a.rssi);
+  d.networks.forEach(n=>{
+   const item=document.createElement("div");item.className="network";
+   const title=document.createElement("strong");title.textContent=n.ssid||"(Hidden network)";
+   const details=document.createElement("small");details.textContent=`${n.rssi} dBm · Channel ${n.channel} · ${n.security}`;
+   const p=document.createElement("div");p.className="progress";const bar=document.createElement("div");bar.style.width=signalQuality(n.rssi)+"%";p.appendChild(bar);
+   item.append(title,details,p);
+   item.addEventListener("click",()=>{
+    document.querySelectorAll(".network").forEach(x=>x.classList.remove("selected"));
+    item.classList.add("selected");selectedNetwork=n.ssid;
+    document.getElementById("selectedSSID").value=selectedNetwork;
+    document.getElementById("wifiPassword").value="";
+   });
+   list.appendChild(item);
+  });
+ } catch(e){list.textContent="Unable to scan networks.";console.error(e);}
+ finally{b.disabled=false;b.textContent="Scan Networks";}
+}
+
+async function connectRouter() {
+ const ssid=selectedNetwork,password=document.getElementById("wifiPassword").value,b=document.getElementById("connectButton");
+ if(!ssid){alert("Please select a network first.");return;}
+ b.disabled=true;b.textContent="Connecting...";
+ try {
+  const r=await fetch("/api/connect",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ssid,password})});
+  if(!r.ok)throw Error("Connection failed");
+  const d=await r.json();document.getElementById("connectionMessage").textContent=d.message||"Connection request sent.";
+  document.getElementById("wifiPassword").value="";await loadStatus();
+ } catch(e){alert("Unable to start connection.");console.error(e);}
+ finally{b.disabled=false;b.textContent="Connect to Router";}
+}
+async function disconnectRouter() {
+ if(!confirm("Disconnect from the router?"))return;
+ try{const r=await fetch("/api/disconnect",{method:"POST"});if(!r.ok)throw Error();await loadStatus();}
+ catch(e){alert("Unable to disconnect.");}
+}
+async function loadClients() {
+ try {
+  const r=await fetch("/api/clients",{cache:"no-store"});if(!r.ok)throw Error();
+  const d=await r.json(),list=document.getElementById("clientsList");list.innerHTML="";
+  if(!d.clients||!d.clients.length){list.textContent="No connected devices.";return;}
+  d.clients.forEach(c=>{
+   const item=document.createElement("div");item.className="client";
+   const mac=document.createElement("strong");mac.textContent=c.mac;
+   const signal=document.createElement("div");signal.className="small";signal.textContent="Signal: "+c.rssi+" dBm";
+   item.append(mac,signal);list.appendChild(item);
+  });
+ } catch(e){console.error("Client loading error:",e);}
+}
+
+async function loadStorage() {
+ const msg=document.getElementById("storageMessage");
+ try {
+  const r=await fetch("/api/storage",{cache:"no-store"});if(!r.ok)throw Error("Storage request failed");
+  const d=await r.json(),total=Number(d.total_bytes??d.total??d.total_size??0),used=Number(d.used_bytes??d.used??d.used_size??0),free=Number(d.free_bytes??d.free??d.free_size??Math.max(0,total-used));
+  document.getElementById("storageTotal").textContent=formatBytes(total);
+  document.getElementById("storageUsed").textContent=formatBytes(used);
+  document.getElementById("storageFree").textContent=formatBytes(free);
+  const pct=total>0?Math.min(100,used/total*100):0;
+  document.getElementById("storageBar").style.width=pct.toFixed(1)+"%";
+  msg.textContent=pct.toFixed(1)+"% of available RAM storage used. Files are cleared on restart.";
+ } catch(e){msg.textContent="Unable to load storage information.";console.error("Storage error:",e);}
+}
+
+async function loadFiles() {
+ const list=document.getElementById("filesList"),count=document.getElementById("fileCount"),b=document.getElementById("refreshFilesButton");
+ b.disabled=true;b.textContent="Refreshing...";list.textContent="Loading stored files...";
+ try {
+  const r=await fetch("/api/files",{cache:"no-store"});if(!r.ok)throw Error("File list request failed");
+  const d=await r.json(),files=Array.isArray(d)?d:(d.files||[]);list.innerHTML="";
+  count.textContent=files.length+(files.length===1?" file":" files");
+  if(!files.length){list.textContent="No files stored yet.";return;}
+  files.forEach(f=>{
+   const item=document.createElement("div");item.className="file-item";
+   const info=document.createElement("div");info.className="file-info";
+   const name=document.createElement("div");name.className="file-name";name.textContent=f.name;
+   const size=document.createElement("div");size.className="file-size";size.textContent=formatBytes(f.size)+" · 🔒 Password protected";
+   info.append(name,size);
+   const actions=document.createElement("div");actions.className="file-actions";
+   const down=document.createElement("button");down.textContent="Download";down.onclick=()=>downloadFile(f.name);
+   const del=document.createElement("button");del.textContent="Delete";del.className="danger";del.onclick=()=>deleteFile(f.name);
+   actions.append(down,del);item.append(info,actions);list.appendChild(item);
+  });
+ } catch(e){list.textContent="Unable to load stored files.";count.textContent="File list unavailable";console.error("File list error:",e);}
+ finally{b.disabled=false;b.textContent="Refresh Files";}
+}
+
+async function uploadFile() {
+ const input=document.getElementById("fileInput"),passwordInput=document.getElementById("uploadPassword");
+ const b=document.getElementById("uploadButton"),msg=document.getElementById("uploadMessage");
+ const progress=document.getElementById("uploadProgress"),bar=document.getElementById("uploadProgressBar");
+ const file=input.files[0],password=passwordInput.value;
+ if(!file){msg.textContent="Please select a file first.";return;}
+ if(file.size===0){msg.textContent="Empty files are not supported.";return;}
+ if(file.size>MAX_FILE_SIZE){msg.textContent="File too large. Maximum allowed size is 32 KB.";return;}
+ if(password.length<8||password.length>128){msg.textContent="File password must be 8–128 characters.";return;}
+ b.disabled=true;b.textContent="Uploading...";progress.style.display="block";bar.style.width="15%";msg.textContent="Uploading and protecting "+file.name+"...";
+ try {
+  const r=await fetch("/api/files/upload?name="+encodeURIComponent(file.name),{
+   method:"POST",headers:{"Content-Type":"application/octet-stream","X-File-Password":password},body:file
+  });
+  const result=await r.json().catch(()=>({}));
+  if(!r.ok)throw Error(result.message||"Upload failed (HTTP "+r.status+")");
+  msg.textContent=result.message||"Protected file uploaded.";bar.style.width="100%";
+  input.value="";passwordInput.value="";await loadFiles();await loadStorage();
+ } catch(e){msg.textContent="Upload failed: "+e.message;console.error("Upload error:",e);}
+ finally{b.disabled=false;b.textContent="Upload Protected File";setTimeout(()=>{progress.style.display="none";bar.style.width="0%"},1000);}
+}
+
+async function downloadFile(name) {
+ const password=prompt("Enter the password for "+name);
+ if(password===null)return;
+ if(password.length<8||password.length>128){alert("Invalid password length.");return;}
+ try {
+  const r=await fetch("/api/files/download?name="+encodeURIComponent(name),{
+   method:"GET",headers:{"X-File-Password":password},cache:"no-store"
+  });
+  if(!r.ok)throw Error(r.status===401?"Incorrect file password.":"Download failed (HTTP "+r.status+").");
+  const blob=await r.blob(),url=URL.createObjectURL(blob),link=document.createElement("a");
+  link.href=url;link.download=name;document.body.appendChild(link);link.click();link.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+ } catch(e){alert(e.message);}
+}
+
+async function deleteFile(name) {
+ const password=prompt("Enter the password for "+name+" to delete it.");
+ if(password===null)return;
+ if(!confirm("Permanently delete "+name+"?"))return;
+ try {
+  const r=await fetch("/api/files/delete?name="+encodeURIComponent(name),{
+   method:"POST",headers:{"X-File-Password":password}
+  });
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw Error(r.status===401?"Incorrect file password.":(d.message||"Delete failed."));
+  alert(d.message||"File deleted.");await loadFiles();await loadStorage();
+ } catch(e){alert(e.message);}
+}
+
+async function restartDevice() {
+ if(!confirm("Are you sure you want to restart the ESP32?"))return;
+ try{await fetch("/api/restart",{method:"POST"});}catch(e){}
+ alert("Restart command sent.");
+}
+
+loadStatus();loadClients();loadStorage();loadFiles();
+setInterval(loadStatus,3000);setInterval(loadClients,5000);setInterval(loadStorage,15000);
+</script>
+</body>
+</html>
